@@ -1,0 +1,141 @@
+function morpho
+    %% === Load & Prep ===
+    D           = load('P6.mat');
+    Fs          = D.sfx;
+    dat         = double(D.d);               % [nCh × nTime]
+    [nCh,nTime] = size(dat);
+
+    %% === Electrode geometry in μm (1 unit = 10 μm) ===
+    nx           = 8;  ny = 4;
+    x_elec_um    = (0:(nx-1)) * 2 * 50;      % 0→1400 μm
+    y_elec_um    = (0:(ny-1)) * 2 * 50;      % 0→600  μm
+    idx_col      = mod(0:nCh-1, nx) + 1;
+    idx_row      = floor((0:nCh-1)/nx) + 1;
+    x_flat       = x_elec_um(idx_col)';      % 32×1
+    y_flat       = y_elec_um(idx_row)';      % 32×1
+
+    %% === Three bands: 100, 50, 13 Hz ===
+    bands = [80 120; 40 60; 11 15];  % Hz
+    realB = zeros(nCh,nTime,3);
+    phiB  = zeros(nCh,nTime,3);
+    for bi = 1:3
+        [b,a] = butter(4, bands(bi,:)/(Fs/2));
+        zf    = filtfilt(b,a, dat')';          % zero‐phase band‐pass
+        ana   = hilbert(zf')';                 % analytic
+        realB(:,:,bi) = real(ana);
+        pw = angle(ana);
+        phiB(:,:,bi)  = unwrap(pw,[],2);
+    end
+
+    %% === Fine spatial grid ===
+    xi_um    = linspace(x_elec_um(1), x_elec_um(end), 700);
+    yi_um    = linspace(y_elec_um(1), y_elec_um(end), 300);
+    [XI,YI]  = meshgrid(xi_um, yi_um);      % 300×700
+
+    %% === Vertical offsets & custom colormaps ===
+    offs = [ +600; 0; -600 ];
+    maps = { autumn(64), winter(64), cool(64) };
+
+    %% === Figure & Axes ===
+    hFig = figure('Name','Morpho','Color','w','KeyPressFcn',@keyPress);
+    hAx  = axes('Parent',hFig); hold(hAx,'on');
+    axis(hAx,'vis3d');
+    xlim(hAx,[xi_um(1) xi_um(end)]);
+    ylim(hAx,[yi_um(1) yi_um(end)]);
+    zlim(hAx,[-1000 1000]);
+    view(hAx,45,30); rotate3d(hAx,'on');
+    hAx.DataAspectRatioMode    = 'auto';
+    hAx.PlotBoxAspectRatioMode = 'manual';
+    hAx.PlotBoxAspectRatio     = [7 3 7];
+
+    %% === Precreate graphics ===
+    surfObj    = gobjects(3,1);
+    scatterObj = gobjects(3,1);
+    for bi = 1:3
+        surfObj(bi) = surf(hAx, XI, YI, zeros(size(XI))+offs(bi), ...
+            'EdgeColor','none','FaceColor','texturemap','FaceAlpha',0.5);
+        scatterObj(bi) = scatter3(hAx, x_flat, y_flat, ...
+            realB(:,1,bi)+offs(bi), 50, 'k', 'filled');
+    end
+
+    % lighting for depth cues
+    shading(hAx,'interp');
+    camlight(hAx,'headlight');
+    lighting(hAx,'gouraud');
+
+    %% === UI Controls ===
+    sld = uicontrol('Style','slider','Units','normalized', ...
+        'Position',[.15 .02 .7 .04],'Min',1,'Max',nTime,'Value',1, ...
+        'SliderStep',[1/(2*(nTime-1)),10/(2*(nTime-1))], ...
+        'Callback',@(s,~) updateFrame(s.Value));
+    txt = uicontrol('Style','text','Units','normalized', ...
+        'Position',[.88 .02 .1 .04],'BackgroundColor','w', ...
+        'String','t = 0.000 s');
+
+    %% === Initial Draw ===
+    currFrame = 1;
+    updateFrame(currFrame);
+
+    %% === Update Function ===
+    function updateFrame(fr)
+        currFrame = fr;
+        t0        = (currFrame-1)/Fs;
+        dt        = 1/Fs;
+        k0   = floor(currFrame);
+        frac = currFrame - k0;
+        k1   = min(k0+1,nTime);
+
+        for bi = 1:3
+            % 1) interpolate real & phase
+            re0 = realB(:,k0,bi); re1 = realB(:,k1,bi);
+            ph0 = phiB(:,k0,bi);  ph1 = phiB(:,k1,bi);
+            re_t = (1-frac)*re0 + frac*re1;
+            ph_t = (1-frac)*ph0 + frac*ph1;
+            % 2) temporal slope & advect
+            if k0>1
+                prev = (1-frac)*phiB(:,k0-1,bi) + frac*phiB(:,k0,bi);
+                dph = (ph_t - prev)*Fs;
+            else
+                dph = zeros(nCh,1);
+            end
+            P = reshape(ph_t, ny, nx);
+            [dPdy,dPdx] = gradient(P,2,2);
+            gX = dPdx(:); gY = dPdy(:); denom = gX.^2+gY.^2+eps;
+            vx = -dph.*gX./denom; vy = -dph.*gY./denom;
+            xa = x_flat + vx*dt; ya = y_flat + vy*dt;
+            % 3) fast scatteredInterpolant
+            F = scatteredInterpolant(xa, ya, re_t, 'natural','none');
+            Z = F(XI,YI); Z(isnan(Z)) = 0;
+            % 4) smooth + boost
+            Z = conv2(Z, ones(11,11)/121, 'same');
+            Z = Z * 1.2;
+            % 5) map to RGB
+            map = maps{bi};
+            mn = min(Z(:)); mx = max(Z(:));
+            idx = round((Z-mn)/(mx-mn)*(size(map,1)-1))+1;
+            idx = max(1,min(size(map,1),idx));
+            C = reshape(map(idx,:), [size(Z),3]);
+            % 6) update graphics
+            set(surfObj(bi), 'ZData', Z+offs(bi), 'CData', C);
+            set(scatterObj(bi), ...
+                'XData', xa, 'YData', ya, ...
+                'ZData', re_t+offs(bi), 'CData', re_t);
+        end
+
+        % UI updates
+        sld.Value = currFrame;
+        txt.String = sprintf('t = %.3f s', t0);
+        title(hAx, sprintf('Stacked 100/50/13 Hz, t=%.3f s',t0));
+        drawnow;
+    end
+
+    %% === Arrow‐key handler ===
+    function keyPress(~,evt)
+        switch evt.Key
+            case 'rightarrow', newF = min(currFrame+0.5,nTime);
+            case 'leftarrow',  newF = max(currFrame-0.5,1);
+            otherwise, return;
+        end
+        updateFrame(newF);
+    end
+end
